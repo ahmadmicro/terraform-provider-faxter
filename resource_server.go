@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -36,7 +37,12 @@ type ServerUpdateRequest struct {
 }
 
 type ResourceResponse struct {
-	Name string `json:"name"`
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Properties struct {
+		IPAddresses []string `json:"ip_addresses"`
+		// Add other fields if needed
+	} `json:"properties"`
 	// ... additional fields if needed
 }
 
@@ -104,6 +110,16 @@ func resourceServer() *schema.Resource {
 					return []interface{}{}, nil
 				},
 			},
+			// New computed attribute to capture IP addresses
+			"ip_addresses": {
+				Type:     schema.TypeList,
+				Computed: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+			},
+			"status": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
 		},
 	}
 }
@@ -166,9 +182,91 @@ func resourceServerCreate(ctx context.Context, d *schema.ResourceData, m interfa
 	}
 
 	d.SetId(resourceResps[0].Name)
+
+	// Implement polling to wait until the server status is "online"
+	pollTimeout := 5 * time.Minute
+	pollInterval := 10 * time.Second
+	deadline := time.Now().Add(pollTimeout)
+
+	for {
+		// Wait for the next poll interval
+		time.Sleep(pollInterval)
+
+		// Check if context is done
+		if ctx.Err() != nil {
+			return diag.FromErr(ctx.Err())
+		}
+
+		// Read the current server status
+		currentStatus, ipAddresses, err := getServerStatus(ctx, c, project, name)
+		if err != nil {
+			return diag.Errorf("Error fetching server status: %s", err)
+		}
+
+		// Update the status in the Terraform state
+		if err := d.Set("status", currentStatus); err != nil {
+			return diag.Errorf("Error setting status: %s", err)
+		}
+
+		// If status is "online", proceed to set ip_addresses and exit the loop
+		if currentStatus == "online" {
+			if err := d.Set("ip_addresses", ipAddresses); err != nil {
+				return diag.Errorf("Error setting ip_addresses: %s", err)
+			}
+			break
+		}
+
+		// Check if the deadline has been reached
+		if time.Now().After(deadline) {
+			return diag.Errorf("Timed out waiting for server '%s' to become online", name)
+		}
+	}
+
 	return diags
 }
 
+// getServerStatus fetches the current status and IP addresses of the server.
+func getServerStatus(ctx context.Context, c *Client, project, name string) (string, []string, error) {
+	// Construct the API path with query parameters
+	path := fmt.Sprintf("/servers/%s?project_name=%s", url.PathEscape(name), url.QueryEscape(project))
+	req, err := c.newRequest("GET", path)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Send the HTTP request
+	resp, err := c.httpClient.Do(req.WithContext(ctx))
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+
+	// Handle 404 Not Found
+	if resp.StatusCode == 404 {
+		return "", nil, fmt.Errorf("server '%s' not found", name)
+	}
+
+	// Check for successful response
+	if resp.StatusCode != 200 {
+		// Read response body for error details
+		body, _ := io.ReadAll(resp.Body)
+		return "", nil, fmt.Errorf("failed to get server status: %s - %s", resp.Status, string(body))
+	}
+
+	// Decode the response
+	var resourceResps ResourceResponse
+	err = json.NewDecoder(resp.Body).Decode(&resourceResps)
+	if err != nil {
+		return "", nil, fmt.Errorf("error decoding read response: %s", err)
+	}
+
+	currentStatus := resourceResps.Status
+	ipAddresses := resourceResps.Properties.IPAddresses
+
+	return currentStatus, ipAddresses, nil
+}
+
+// resourceServerRead handles reading the server resource from the API.
 func resourceServerRead(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	c := m.(*Client)
 	var diags diag.Diagnostics
@@ -176,28 +274,25 @@ func resourceServerRead(ctx context.Context, d *schema.ResourceData, m interface
 	name := d.Id()
 	project := d.Get("project").(string)
 
-	path := fmt.Sprintf("/servers/%s?project_name=%s", url.PathEscape(name), url.QueryEscape(project))
-	req, err := c.newRequest("GET", path)
+	// Read the current server status and IP addresses
+	currentStatus, ipAddresses, err := getServerStatus(ctx, c, project, name)
 	if err != nil {
-		return diag.FromErr(err)
+		if err.Error() == fmt.Sprintf("server '%s' not found", name) {
+			d.SetId("")
+			return diags
+		}
+		return diag.Errorf("Error reading server: %s", err)
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return diag.FromErr(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 404 {
-		d.SetId("")
-		return diags
+	// Update the state with status and ip_addresses
+	if err := d.Set("status", currentStatus); err != nil {
+		return diag.Errorf("Error setting status: %s", err)
 	}
 
-	if resp.StatusCode != 200 {
-		return diag.Errorf("Failed to read server: %s", resp.Status)
+	if err := d.Set("ip_addresses", ipAddresses); err != nil {
+		return diag.Errorf("Error setting ip_addresses: %s", err)
 	}
 
-	// If needed, parse the server info and update state accordingly.
 	return diags
 }
 
