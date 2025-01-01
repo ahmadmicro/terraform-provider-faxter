@@ -26,6 +26,7 @@ func Provider() *schema.Provider {
 			"faxter_router":         resourceRouter(),
 			"faxter_volume":         resourceVolume(),
 			"faxter_security_group": resourceSecurityGroup(),
+			"faxter_loadbalancer":   resourceLoadBalancer(),
 		},
 		ConfigureContextFunc: providerConfigure,
 	}

@@ -1,0 +1,319 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/url"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+)
+
+type LoadBalancerCreateRequest struct {
+	Project           string   `json:"project,omitempty"`
+	Name              string   `json:"name"`
+	Port              int      `json:"port,omitempty"`
+	Networks          []string `json:"networks,omitempty"`
+	KeyName           string   `json:"key_name,omitempty"`
+	RequestFloatingIP bool     `json:"request_floating_ip,omitempty"`
+	SSLEnabled        bool     `json:"ssl_enabled,omitempty"`
+	Servers           []string `json:"servers,omitempty"`
+	SecurityGroups    []string `json:"security_groups,omitempty"`
+}
+
+// If your API has a separate "Update" schema, define it similarly.
+// For simplicity, we'll reuse a structure, but typically you'd have a separate struct.
+type LoadBalancerUpdateRequest struct {
+	Name              string    `json:"name"` // required
+	Port              *int      `json:"port,omitempty"`
+	Networks          *[]string `json:"networks,omitempty"`
+	KeyName           *string   `json:"key_name,omitempty"`
+	RequestFloatingIP *bool     `json:"request_floating_ip,omitempty"`
+	SSLEnabled        *bool     `json:"ssl_enabled,omitempty"`
+	Servers           *[]string `json:"servers,omitempty"`
+	SecurityGroups    *[]string `json:"security_groups,omitempty"`
+}
+
+// The API response might look like a ResourceResponse, or a custom LB struct
+type LoadBalancerResponse struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Properties struct {
+		// Possibly more detail here if your API returns it
+	} `json:"properties"`
+}
+
+func resourceLoadBalancer() *schema.Resource {
+	return &schema.Resource{
+		CreateContext: resourceLoadBalancerCreate,
+		ReadContext:   resourceLoadBalancerRead,
+		UpdateContext: resourceLoadBalancerUpdate,
+		DeleteContext: resourceLoadBalancerDelete,
+
+		Schema: map[string]*schema.Schema{
+			"project": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Default:     "default",
+				Description: "Name of the Faxter project in which to create the load balancer.",
+			},
+			"name": {
+				Type:        schema.TypeString,
+				Required:    true,
+				Description: "Unique name of the load balancer.",
+			},
+			"port": {
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Default:     80,
+				Description: "The port on which the load balancer listens.",
+			},
+			"networks": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+				DefaultFunc: func() (interface{}, error) {
+					return []interface{}{"public1"}, nil
+				},
+				Description: "List of networks to which the load balancer is attached.",
+			},
+			"key_name": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "Optional SSH key name used if the LB runs in a VM-based context.",
+			},
+			"request_floating_ip": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     true,
+				Description: "Whether to request a floating IP for external connectivity.",
+			},
+			"ssl_enabled": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				Description: "If true, the load balancer will terminate SSL.",
+			},
+			"servers": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+				DefaultFunc: func() (interface{}, error) {
+					return []interface{}{}, nil
+				},
+				Description: "List of backend server identifiers (IP:Port or some reference).",
+			},
+			"security_groups": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+				DefaultFunc: func() (interface{}, error) {
+					return []interface{}{"default"}, nil
+				},
+				Description: "One or more security groups attached to this load balancer.",
+			},
+			"status": {
+				Type:        schema.TypeString,
+				Computed:    true,
+				Description: "Current status of the load balancer (if returned by the API).",
+			},
+		},
+	}
+}
+
+func resourceLoadBalancerCreate(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
+	c := m.(*Client)
+	var diags diag.Diagnostics
+
+	project := d.Get("project").(string)
+	name := d.Get("name").(string)
+	port := d.Get("port").(int)
+	networks := expandStringList(d.Get("networks").([]interface{}))
+	keyName := d.Get("key_name").(string)
+	requestFloatingIP := d.Get("request_floating_ip").(bool)
+	sslEnabled := d.Get("ssl_enabled").(bool)
+	servers := expandStringList(d.Get("servers").([]interface{}))
+	securityGroups := expandStringList(d.Get("security_groups").([]interface{}))
+
+	reqData := &LoadBalancerCreateRequest{
+		Project:           project,
+		Name:              name,
+		Port:              port,
+		Networks:          networks,
+		KeyName:           keyName,
+		RequestFloatingIP: requestFloatingIP,
+		SSLEnabled:        sslEnabled,
+		Servers:           servers,
+		SecurityGroups:    securityGroups,
+	}
+
+	bodyBytes, _ := json.Marshal(reqData)
+	req, err := c.newRequest("POST", "/loadbalancers/")
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	resp, err := c.httpClient.Do(req.WithContext(ctx))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return diag.Errorf("Failed to create load balancer: %s - %s", resp.Status, string(body))
+	}
+
+	var lbResp LoadBalancerResponse
+	err = json.NewDecoder(resp.Body).Decode(&lbResp)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	// Use the name from the response as the Terraform ID
+	d.SetId(lbResp.Name)
+
+	// If the API returns a status, record it
+	_ = d.Set("status", lbResp.Status)
+
+	return diags
+}
+
+func resourceLoadBalancerRead(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
+	c := m.(*Client)
+	var diags diag.Diagnostics
+
+	project := d.Get("project").(string)
+	name := d.Id()
+
+	path := fmt.Sprintf("/loadbalancers/%s?project_name=%s", url.PathEscape(name), url.PathEscape(project))
+	req, err := c.newRequest("GET", path)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	resp, err := c.httpClient.Do(req.WithContext(ctx))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		d.SetId("")
+		return diags
+	}
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return diag.Errorf("Failed to read load balancer: %s - %s", resp.Status, string(body))
+	}
+
+	var lbResp LoadBalancerResponse
+	err = json.NewDecoder(resp.Body).Decode(&lbResp)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	// Update any known fields. The API might not return all fields; if so, we skip updating them.
+	_ = d.Set("status", lbResp.Status)
+
+	return diags
+}
+
+func resourceLoadBalancerUpdate(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
+	c := m.(*Client)
+	var diags diag.Diagnostics
+
+	oldName := d.Id()
+	project := d.Get("project").(string)
+	newName := d.Get("name").(string)
+
+	updateReq := &LoadBalancerUpdateRequest{
+		Name: newName, // The API requires name
+	}
+
+	if d.HasChange("port") {
+		newPort := d.Get("port").(int)
+		updateReq.Port = &newPort
+	}
+	if d.HasChange("networks") {
+		nets := expandStringList(d.Get("networks").([]interface{}))
+		updateReq.Networks = &nets
+	}
+	if d.HasChange("key_name") {
+		newKeyName := d.Get("key_name").(string)
+		updateReq.KeyName = &newKeyName
+	}
+	if d.HasChange("request_floating_ip") {
+		rfi := d.Get("request_floating_ip").(bool)
+		updateReq.RequestFloatingIP = &rfi
+	}
+	if d.HasChange("ssl_enabled") {
+		newSSL := d.Get("ssl_enabled").(bool)
+		updateReq.SSLEnabled = &newSSL
+	}
+	if d.HasChange("servers") {
+		newServers := expandStringList(d.Get("servers").([]interface{}))
+		updateReq.Servers = &newServers
+	}
+	if d.HasChange("security_groups") {
+		newSGs := expandStringList(d.Get("security_groups").([]interface{}))
+		updateReq.SecurityGroups = &newSGs
+	}
+
+	bodyBytes, _ := json.Marshal(updateReq)
+	path := fmt.Sprintf("/loadbalancers/%s?project_name=%s", url.PathEscape(oldName), url.PathEscape(project))
+	req, err := c.newRequest("PUT", path)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	resp, err := c.httpClient.Do(req.WithContext(ctx))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return diag.Errorf("Failed to update load balancer: %s - %s", resp.Status, string(body))
+	}
+
+	// If the name changed, update the ID
+	d.SetId(newName)
+
+	return diags
+}
+
+func resourceLoadBalancerDelete(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
+	c := m.(*Client)
+	var diags diag.Diagnostics
+
+	name := d.Id()
+	project := d.Get("project").(string)
+	path := fmt.Sprintf("/loadbalancers/%s?project_name=%s", url.PathEscape(name), url.PathEscape(project))
+
+	req, err := c.newRequest("DELETE", path)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	resp, err := c.httpClient.Do(req.WithContext(ctx))
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return diag.Errorf("Failed to delete load balancer: %s - %s", resp.Status, string(body))
+	}
+
+	d.SetId("")
+	return diags
+}

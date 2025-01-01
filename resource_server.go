@@ -167,6 +167,16 @@ func resourceServerCreate(ctx context.Context, d *schema.ResourceData, m interfa
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		// Attempt to parse the "detail" field from response body
+		body, _ := io.ReadAll(resp.Body)
+		var errorMap map[string]interface{}
+		if err := json.Unmarshal(body, &errorMap); err == nil {
+			if detail, ok := errorMap["detail"].(string); ok {
+				return diag.Errorf("Failed to create server: %s - %s", resp.Status, detail)
+			}
+		}
+
+		// If no "detail" or JSON parse fails, return a generic error
 		return diag.Errorf("Failed to create server: %s", resp.Status)
 	}
 
@@ -198,7 +208,7 @@ func resourceServerCreate(ctx context.Context, d *schema.ResourceData, m interfa
 		}
 
 		// Read the current server status
-		currentStatus, ipAddresses, err := getServerStatus(ctx, c, project, name)
+		currentStatus, ipAddresses, err := getServerStatus(ctx, c, project, d.Id())
 		if err != nil {
 			return diag.Errorf("Error fetching server status: %s", err)
 		}
