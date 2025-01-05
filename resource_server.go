@@ -14,33 +14,36 @@ import (
 )
 
 type ServerCreateRequest struct {
-	Project         string   `json:"project,omitempty"`
-	Name            string   `json:"name"`
-	Flavor          string   `json:"flavor,omitempty"`
-	Image           string   `json:"image,omitempty"`
-	KeyName         string   `json:"key_name"`
-	SecurityGroups  []string `json:"security_groups,omitempty"`
-	RequestFloating bool     `json:"request_floating_ip,omitempty"`
-	CloudInit       string   `json:"cloud_init,omitempty"`
-	Networks        []string `json:"networks,omitempty"`
-	Volumes         []string `json:"volumes,omitempty"`
+	Project           string   `json:"project,omitempty"`
+	Name              string   `json:"name"`
+	Flavor            string   `json:"flavor,omitempty"`
+	Image             string   `json:"image,omitempty"`
+	KeyName           string   `json:"key_name"`
+	SecurityGroups    []string `json:"security_groups,omitempty"`
+	RequestFloatingIP bool     `json:"request_floating_ip,omitempty"`
+	CloudInit         string   `json:"cloud_init,omitempty"`
+	Networks          []string `json:"networks,omitempty"`
+	SubNetworks       []string `json:"sub_networks,omitempty"`
+	Volumes           []string `json:"volumes,omitempty"`
 }
 
 type ServerUpdateRequest struct {
-	Name            string    `json:"name"` // required by ServerUpdate schema
-	Flavor          *string   `json:"flavor,omitempty"`
-	Image           *string   `json:"image,omitempty"`
-	SecurityGroups  *[]string `json:"security_groups,omitempty"`
-	RequestFloating *bool     `json:"request_floating_ip,omitempty"`
-	Networks        *[]string `json:"networks,omitempty"`
-	Volumes         *[]string `json:"volumes,omitempty"`
+	Name              string    `json:"name"` // required by ServerUpdate schema
+	Flavor            *string   `json:"flavor,omitempty"`
+	Image             *string   `json:"image,omitempty"`
+	SecurityGroups    *[]string `json:"security_groups,omitempty"`
+	RequestFloatingIP *bool     `json:"request_floating_ip,omitempty"`
+	Networks          *[]string `json:"networks,omitempty"`
+	SubNetworks       *[]string `json:"subnetworks,omitempty"`
+	Volumes           *[]string `json:"volumes,omitempty"`
 }
 
 type ResourceResponse struct {
 	Name       string `json:"name"`
 	Status     string `json:"status"`
 	Properties struct {
-		IPAddresses []string `json:"ip_addresses"`
+		IPAddresses     []string `json:"ip_addresses"`
+		RequestFloating bool     `json:"request_floating_ip"`
 		// Add other fields if needed
 	} `json:"properties"`
 	// ... additional fields if needed
@@ -87,7 +90,7 @@ func resourceServer() *schema.Resource {
 			"request_floating_ip": {
 				Type:     schema.TypeBool,
 				Optional: true,
-				Default:  true,
+				//Default:  true,
 			},
 			"cloud_init": {
 				Type:     schema.TypeString,
@@ -100,6 +103,14 @@ func resourceServer() *schema.Resource {
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				DefaultFunc: func() (interface{}, error) {
 					return []interface{}{"public1"}, nil
+				},
+			},
+			"sub_networks": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+				DefaultFunc: func() (interface{}, error) {
+					return []interface{}{}, nil
 				},
 			},
 			"volumes": {
@@ -133,25 +144,29 @@ func resourceServerCreate(ctx context.Context, d *schema.ResourceData, m interfa
 	flavor := d.Get("flavor").(string)
 	image := d.Get("image").(string)
 	keyName := d.Get("key_name").(string)
-	requestFloating := d.Get("request_floating_ip").(bool)
+	requestFloatingIP := d.Get("request_floating_ip").(bool)
 	cloudInit := d.Get("cloud_init").(string)
 
 	networks := expandStringList(d.Get("networks").([]interface{}))
+	sub_networks := expandStringList(d.Get("sub_networks").([]interface{}))
 	volumes := expandStringList(d.Get("volumes").([]interface{}))
 	securityGroups := expandStringList(d.Get("security_groups").([]interface{}))
 
 	reqData := &ServerCreateRequest{
-		Project:         project,
-		Name:            name,
-		Flavor:          flavor,
-		Image:           image,
-		KeyName:         keyName,
-		SecurityGroups:  securityGroups,
-		RequestFloating: requestFloating,
-		CloudInit:       cloudInit,
-		Networks:        networks,
-		Volumes:         volumes,
+		Project:           project,
+		Name:              name,
+		Flavor:            flavor,
+		Image:             image,
+		KeyName:           keyName,
+		SecurityGroups:    securityGroups,
+		RequestFloatingIP: requestFloatingIP,
+		CloudInit:         cloudInit,
+		Networks:          networks,
+		SubNetworks:       sub_networks,
+		Volumes:           volumes,
 	}
+
+	fmt.Printf("%#v\n", reqData)
 
 	bodyBytes, _ := json.Marshal(reqData)
 	req, err := c.newRequest("POST", "/servers/")
@@ -159,6 +174,8 @@ func resourceServerCreate(ctx context.Context, d *schema.ResourceData, m interfa
 		return diag.FromErr(err)
 	}
 	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	fmt.Printf("%#v\n", req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -208,7 +225,7 @@ func resourceServerCreate(ctx context.Context, d *schema.ResourceData, m interfa
 		}
 
 		// Read the current server status
-		currentStatus, ipAddresses, err := getServerStatus(ctx, c, project, d.Id())
+		currentStatus, ipAddresses, _, err := getServerStatus(ctx, c, project, d.Id())
 		if err != nil {
 			return diag.Errorf("Error fetching server status: %s", err)
 		}
@@ -226,6 +243,11 @@ func resourceServerCreate(ctx context.Context, d *schema.ResourceData, m interfa
 			break
 		}
 
+		// if status is "error", return an error
+		if currentStatus == "error" {
+			return diag.Errorf("Server '%s' is in an error state", name)
+		}
+
 		// Check if the deadline has been reached
 		if time.Now().After(deadline) {
 			return diag.Errorf("Timed out waiting for server '%s' to become online", name)
@@ -236,44 +258,45 @@ func resourceServerCreate(ctx context.Context, d *schema.ResourceData, m interfa
 }
 
 // getServerStatus fetches the current status and IP addresses of the server.
-func getServerStatus(ctx context.Context, c *Client, project, name string) (string, []string, error) {
+func getServerStatus(ctx context.Context, c *Client, project, name string) (string, []string, bool, error) {
 	// Construct the API path with query parameters
 	path := fmt.Sprintf("/servers/%s?project_name=%s", url.PathEscape(name), url.QueryEscape(project))
 	req, err := c.newRequest("GET", path)
 	if err != nil {
-		return "", nil, err
+		return "", nil, true, err
 	}
 
 	// Send the HTTP request
 	resp, err := c.httpClient.Do(req.WithContext(ctx))
 	if err != nil {
-		return "", nil, err
+		return "", nil, true, err
 	}
 	defer resp.Body.Close()
 
 	// Handle 404 Not Found
 	if resp.StatusCode == 404 {
-		return "", nil, fmt.Errorf("server '%s' not found", name)
+		return "", nil, true, fmt.Errorf("server '%s' not found", name)
 	}
 
 	// Check for successful response
 	if resp.StatusCode != 200 {
 		// Read response body for error details
 		body, _ := io.ReadAll(resp.Body)
-		return "", nil, fmt.Errorf("failed to get server status: %s - %s", resp.Status, string(body))
+		return "", nil, true, fmt.Errorf("failed to get server status: %s - %s", resp.Status, string(body))
 	}
 
 	// Decode the response
 	var resourceResps ResourceResponse
 	err = json.NewDecoder(resp.Body).Decode(&resourceResps)
 	if err != nil {
-		return "", nil, fmt.Errorf("error decoding read response: %s", err)
+		return "", nil, true, fmt.Errorf("error decoding read response: %s", err)
 	}
 
 	currentStatus := resourceResps.Status
 	ipAddresses := resourceResps.Properties.IPAddresses
+	request_floating := resourceResps.Properties.RequestFloating
 
-	return currentStatus, ipAddresses, nil
+	return currentStatus, ipAddresses, request_floating, nil
 }
 
 // resourceServerRead handles reading the server resource from the API.
@@ -285,7 +308,7 @@ func resourceServerRead(ctx context.Context, d *schema.ResourceData, m interface
 	project := d.Get("project").(string)
 
 	// Read the current server status and IP addresses
-	currentStatus, ipAddresses, err := getServerStatus(ctx, c, project, name)
+	currentStatus, ipAddresses, request_floating, err := getServerStatus(ctx, c, project, name)
 	if err != nil {
 		if err.Error() == fmt.Sprintf("server '%s' not found", name) {
 			d.SetId("")
@@ -301,6 +324,10 @@ func resourceServerRead(ctx context.Context, d *schema.ResourceData, m interface
 
 	if err := d.Set("ip_addresses", ipAddresses); err != nil {
 		return diag.Errorf("Error setting ip_addresses: %s", err)
+	}
+
+	if err := d.Set("request_floating_ip", request_floating); err != nil {
+		return diag.Errorf("Error setting request_floating_ip: %s", err)
 	}
 
 	return diags
@@ -328,11 +355,15 @@ func resourceServerUpdate(ctx context.Context, d *schema.ResourceData, m interfa
 	}
 	if d.HasChange("request_floating_ip") {
 		rf := d.Get("request_floating_ip").(bool)
-		updateReq.RequestFloating = &rf
+		updateReq.RequestFloatingIP = &rf
 	}
 	if d.HasChange("networks") {
 		networks := expandStringList(d.Get("networks").([]interface{}))
 		updateReq.Networks = &networks
+	}
+	if d.HasChange("sub_networks") {
+		subNetworks := expandStringList(d.Get("sub_networks").([]interface{}))
+		updateReq.SubNetworks = &subNetworks
 	}
 	if d.HasChange("volumes") {
 		volumes := expandStringList(d.Get("volumes").([]interface{}))

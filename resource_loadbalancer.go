@@ -12,29 +12,38 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
+// ServerItem represents a single backend server object for the load balancer.
+type ServerItem struct {
+	IP       string `json:"ip"`
+	Port     int    `json:"port"`
+	Endpoint string `json:"endpoint"`
+}
+
 type LoadBalancerCreateRequest struct {
-	Project           string   `json:"project,omitempty"`
-	Name              string   `json:"name"`
-	Port              int      `json:"port,omitempty"`
-	Networks          []string `json:"networks,omitempty"`
-	KeyName           string   `json:"key_name,omitempty"`
-	RequestFloatingIP bool     `json:"request_floating_ip,omitempty"`
-	SSLEnabled        bool     `json:"ssl_enabled,omitempty"`
-	Servers           []string `json:"servers,omitempty"`
-	SecurityGroups    []string `json:"security_groups,omitempty"`
+	Project           string       `json:"project,omitempty"`
+	Name              string       `json:"name"`
+	Port              int          `json:"port,omitempty"`
+	Networks          []string     `json:"networks,omitempty"`
+	SubNetworks       []string     `json:"sub_networks,omitempty"`
+	KeyName           string       `json:"key_name,omitempty"`
+	RequestFloatingIP bool         `json:"request_floating_ip,omitempty"`
+	SSLEnabled        bool         `json:"ssl_enabled,omitempty"`
+	Servers           []ServerItem `json:"servers,omitempty"`
+	SecurityGroups    []string     `json:"security_groups,omitempty"`
 }
 
 // If your API has a separate "Update" schema, define it similarly.
 // For simplicity, we'll reuse a structure, but typically you'd have a separate struct.
 type LoadBalancerUpdateRequest struct {
-	Name              string    `json:"name"` // required
-	Port              *int      `json:"port,omitempty"`
-	Networks          *[]string `json:"networks,omitempty"`
-	KeyName           *string   `json:"key_name,omitempty"`
-	RequestFloatingIP *bool     `json:"request_floating_ip,omitempty"`
-	SSLEnabled        *bool     `json:"ssl_enabled,omitempty"`
-	Servers           *[]string `json:"servers,omitempty"`
-	SecurityGroups    *[]string `json:"security_groups,omitempty"`
+	Name              string        `json:"name"` // required
+	Port              *int          `json:"port,omitempty"`
+	Networks          *[]string     `json:"networks,omitempty"`
+	SubNetworks       *[]string     `json:"sub_networks,omitempty"`
+	KeyName           *string       `json:"key_name,omitempty"`
+	RequestFloatingIP *bool         `json:"request_floating_ip,omitempty"`
+	SSLEnabled        *bool         `json:"ssl_enabled,omitempty"`
+	Servers           *[]ServerItem `json:"servers,omitempty"`
+	SecurityGroups    *[]string     `json:"security_groups,omitempty"`
 }
 
 // The API response might look like a ResourceResponse, or a custom LB struct
@@ -80,6 +89,14 @@ func resourceLoadBalancer() *schema.Resource {
 				},
 				Description: "List of networks to which the load balancer is attached.",
 			},
+			"sub_networks": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
+				DefaultFunc: func() (interface{}, error) {
+					return []interface{}{}, nil
+				},
+			},
 			"key_name": {
 				Type:        schema.TypeString,
 				Optional:    true,
@@ -98,13 +115,29 @@ func resourceLoadBalancer() *schema.Resource {
 				Description: "If true, the load balancer will terminate SSL.",
 			},
 			"servers": {
-				Type:     schema.TypeList,
-				Optional: true,
-				Elem:     &schema.Schema{Type: schema.TypeString},
-				DefaultFunc: func() (interface{}, error) {
-					return []interface{}{}, nil
+				Type:        schema.TypeList,
+				Required:    true,
+				Description: "List of backend server objects for this load balancer.",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"ip": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "IP address of the backend server.",
+						},
+						"port": {
+							Type:        schema.TypeInt,
+							Required:    true,
+							Description: "Port of the backend server.",
+						},
+						"endpoint": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							Default:     "/",
+							Description: "Endpoint path for this backend server.",
+						},
+					},
 				},
-				Description: "List of backend server identifiers (IP:Port or some reference).",
 			},
 			"security_groups": {
 				Type:     schema.TypeList,
@@ -132,10 +165,11 @@ func resourceLoadBalancerCreate(ctx context.Context, d *schema.ResourceData, m i
 	name := d.Get("name").(string)
 	port := d.Get("port").(int)
 	networks := expandStringList(d.Get("networks").([]interface{}))
+	sub_networks := expandStringList(d.Get("sub_networks").([]interface{}))
 	keyName := d.Get("key_name").(string)
 	requestFloatingIP := d.Get("request_floating_ip").(bool)
 	sslEnabled := d.Get("ssl_enabled").(bool)
-	servers := expandStringList(d.Get("servers").([]interface{}))
+	servers := expandServerItems(d.Get("servers").([]interface{}))
 	securityGroups := expandStringList(d.Get("security_groups").([]interface{}))
 
 	reqData := &LoadBalancerCreateRequest{
@@ -143,6 +177,7 @@ func resourceLoadBalancerCreate(ctx context.Context, d *schema.ResourceData, m i
 		Name:              name,
 		Port:              port,
 		Networks:          networks,
+		SubNetworks:       sub_networks,
 		KeyName:           keyName,
 		RequestFloatingIP: requestFloatingIP,
 		SSLEnabled:        sslEnabled,
@@ -244,6 +279,10 @@ func resourceLoadBalancerUpdate(ctx context.Context, d *schema.ResourceData, m i
 		nets := expandStringList(d.Get("networks").([]interface{}))
 		updateReq.Networks = &nets
 	}
+	if d.HasChange("sub_networks") {
+		subs := expandStringList(d.Get("sub_networks").([]interface{}))
+		updateReq.SubNetworks = &subs
+	}
 	if d.HasChange("key_name") {
 		newKeyName := d.Get("key_name").(string)
 		updateReq.KeyName = &newKeyName
@@ -257,7 +296,7 @@ func resourceLoadBalancerUpdate(ctx context.Context, d *schema.ResourceData, m i
 		updateReq.SSLEnabled = &newSSL
 	}
 	if d.HasChange("servers") {
-		newServers := expandStringList(d.Get("servers").([]interface{}))
+		newServers := expandServerItems(d.Get("servers").([]interface{}))
 		updateReq.Servers = &newServers
 	}
 	if d.HasChange("security_groups") {
@@ -316,4 +355,18 @@ func resourceLoadBalancerDelete(ctx context.Context, d *schema.ResourceData, m i
 
 	d.SetId("")
 	return diags
+}
+
+// expandServerItems converts a []interface{} -> []ServerItem
+func expandServerItems(list []interface{}) []ServerItem {
+	servers := make([]ServerItem, 0, len(list))
+	for _, v := range list {
+		serverMap := v.(map[string]interface{})
+		servers = append(servers, ServerItem{
+			IP:       serverMap["ip"].(string),
+			Port:     serverMap["port"].(int),
+			Endpoint: serverMap["endpoint"].(string),
+		})
+	}
+	return servers
 }

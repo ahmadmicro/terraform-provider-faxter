@@ -15,10 +15,15 @@ import (
 
 // Reflecting the schema from the API:
 // NetworkCreate requires a "subnets" array of objects {name: string, cidr: string}.
-
+type RouteRule struct {
+	Destination string `json:"destination"`
+	Nexthop     string `json:"nexthop"`
+}
 type SubnetCreateRequest struct {
-	Name string `json:"name"`
-	CIDR string `json:"cidr"`
+	Name         string      `json:"name"`
+	CIDR         string      `json:"cidr"`
+	Gateway      string      `json:"gateway,omitempty"`
+	StaticRoutes []RouteRule `json:"static_routes,omitempty"`
 }
 
 type NetworkCreateRequest struct {
@@ -57,6 +62,26 @@ func resourceNetwork() *schema.Resource {
 							Type:     schema.TypeString,
 							Required: true,
 						},
+						"gateway": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"static_routes": {
+							Type:     schema.TypeList,
+							Optional: true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"destination": {
+										Type:     schema.TypeString,
+										Required: true,
+									},
+									"nexthop": {
+										Type:     schema.TypeString,
+										Required: true,
+									},
+								},
+							},
+						},
 					},
 				},
 				Description: "A list of subnet configurations for this network.",
@@ -73,13 +98,31 @@ func resourceNetworkCreate(ctx context.Context, d *schema.ResourceData, m interf
 	name := d.Get("name").(string)
 	subnetsIface := d.Get("subnets").([]interface{})
 
+	// Prepare the list of subnets for the request
 	var subnets []SubnetCreateRequest
 	for _, subnetRaw := range subnetsIface {
 		subnetMap := subnetRaw.(map[string]interface{})
-		subnets = append(subnets, SubnetCreateRequest{
-			Name: subnetMap["name"].(string),
-			CIDR: subnetMap["cidr"].(string),
-		})
+
+		// Convert "static_routes" from []interface{} to []RouteRule
+		var staticRoutes []RouteRule
+		if staticRoutesIface, ok := subnetMap["static_routes"].([]interface{}); ok {
+			for _, routeRaw := range staticRoutesIface {
+				routeMap := routeRaw.(map[string]interface{})
+				staticRoutes = append(staticRoutes, RouteRule{
+					Destination: routeMap["destination"].(string),
+					Nexthop:     routeMap["nexthop"].(string),
+				})
+			}
+		}
+
+		subnetReq := SubnetCreateRequest{
+			Name:         subnetMap["name"].(string),
+			CIDR:         subnetMap["cidr"].(string),
+			Gateway:      subnetMap["gateway"].(string), // Optional if not set in schema
+			StaticRoutes: staticRoutes,
+		}
+
+		subnets = append(subnets, subnetReq)
 	}
 
 	reqData := &NetworkCreateRequest{
