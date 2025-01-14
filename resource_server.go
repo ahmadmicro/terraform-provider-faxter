@@ -20,7 +20,7 @@ type ServerCreateRequest struct {
 	Image             string   `json:"image,omitempty"`
 	KeyName           string   `json:"key_name"`
 	SecurityGroups    []string `json:"security_groups,omitempty"`
-	RequestFloatingIP bool     `json:"request_floating_ip,omitempty"`
+	RequestFloatingIP bool     `json:"request_floating_ip"`
 	CloudInit         string   `json:"cloud_init,omitempty"`
 	Networks          []string `json:"networks,omitempty"`
 	SubNetworks       []string `json:"sub_networks,omitempty"`
